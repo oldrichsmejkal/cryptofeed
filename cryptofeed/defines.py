@@ -1,9 +1,31 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
+
+
+Defines contains all constant string definitions for Cryptofeed,
+as well as some documentation (in comment form) regarding
+the book definitions and structure
 '''
+BITSTAMP = 'BITSTAMP'
+BITFINEX = 'BITFINEX'
+COINBASE = 'COINBASE'
+GEMINI = 'GEMINI'
+HITBTC = 'HITBTC'
+POLONIEX = 'POLONIEX'
+BITMEX = 'BITMEX'
+KRAKEN = 'KRAKEN'
+BINANCE = 'BINANCE'
+EXX = 'EXX'
+HUOBI = 'HUOBI'
+HUOBI_US = 'HUOBI_US'
+OKCOIN = 'OKCOIN'
+OKEX = 'OKEX'
+COINBENE = 'COINBENE'
+DERIBIT = 'DERIBIT'
+
 L2_BOOK = 'l2_book'
 L3_BOOK = 'l3_book'
 BOOK_DELTA = 'book_delta'
@@ -11,13 +33,32 @@ TRADES = 'trades'
 TICKER = 'ticker'
 VOLUME = 'volume'
 FUNDING = 'funding'
+INSTRUMENT = 'instrument'
 UNSUPPORTED = 'unsupported'
+
+L2_BOOK_SWAP = 'l2_book_swap'
+TRADES_SWAP = 'trades_swap'
+TICKER_SWAP = 'ticker_swap'
+
+BUY = 'buy'
+SELL = 'sell'
 
 BID = 'bid'
 ASK = 'ask'
+UND = 'undefined'
 
-DEL = 'delete'
-UPD = 'update'
+LIMIT = 'limit'
+MARKET = 'market'
+MAKER_OR_CANCEL = 'maker-or-cancel'
+FILL_OR_KILL = 'fill-or-kill'
+IMMEDIATE_OR_CANCEL = 'immediate-or-cancel'
+
+OPEN = 'open'
+PENDING = 'pending'
+FILLED = 'filled'
+PARTIAL = 'partial'
+CANCELLED = 'cancelled'
+
 
 """
 L2 Orderbook Layout
@@ -88,20 +129,67 @@ Delta is in format of:
 
 for L2 books, it is as below
 for L3 books:
-    * DEL will be an array of order-id, price tuples
-    * UPD will include order-id in each tuple
+    * tuples will be order-id, price, size
 
     {
-        BID: {
-            DEL: [price, price, price, ...]
-            UPD: [(price, size), (price, size), ...]
-        },
-        ASK: {
-            DEL: [price, price, price, ...]
-            UPD: [(price, size), (price, size), ...]
-        }
+        BID: [ (price, size), (price, size), (price, size), ...],
+        ASK: [ (price, size), (price, size), (price, size), ...]
     }
 
-    DEL - price levels should be deleted (for L3 the order id should be deleted, if the price level is now empty, delete the price level)
-    UPD - prices should have the quantity set to size (these are not price deltas). For L3, add the order id at the price level
+    For L2 books a size of 0 means the price level should be deleted.
+    For L3 books, a size of 0 means the order should be deleted. If there are
+    no orders at the price, the price level can be deleted.
+
+
+
+Trading Responses
+
+Balances:
+
+{
+    coin/fiat: {
+        total: Decimal, # total amount
+        available: Decimal # available for trading
+    },
+    ...
+}
+
+
+Orders:
+
+[
+    {
+        order_id: str,
+        symbol: str,
+        side: str,
+        order_type: limit/market/etc,
+        price: Decimal,
+        total: Decimal,
+        executed: Decimal,
+        pending: Decimal,
+        timestamp: float,
+        order_status: FILLED/PARTIAL/CANCELLED/OPEN
+    },
+    {...},
+    ...
+
+]
+
+
+Trade history:
+[{
+    'price': Decimal,
+    'amount': Decimal,
+    'timestamp': float,
+    'side': str
+    'fee_currency': str,
+    'fee_amount': Decimal,
+    'trade_id': str,
+    'order_id': str
+    },
+    {
+        ...
+    }
+]
+
 """

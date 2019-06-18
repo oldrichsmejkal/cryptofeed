@@ -1,41 +1,52 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
 import asyncio
-from datetime import datetime as dt
-from datetime import timedelta
+from time import time as time
 from socket import error as socket_error
+import zlib
 
 import websockets
 from websockets import ConnectionClosed
 
-from cryptofeed.defines import TICKER
+from cryptofeed.defines import L2_BOOK
 from cryptofeed.log import get_logger
-from cryptofeed.exchanges import GEMINI, HITBTC, BITFINEX, BITMEX, BITSTAMP, POLONIEX
-from cryptofeed.exchanges import GDAX as Gdax
-from cryptofeed import Gemini, GDAX, HitBTC, Bitfinex, Bitmex, Bitstamp, Poloniex
+from cryptofeed.defines import DERIBIT, BINANCE, GEMINI, HITBTC, BITFINEX, BITMEX, BITSTAMP, POLONIEX, COINBASE, KRAKEN, HUOBI, HUOBI_US, OKCOIN, OKEX, COINBENE
+from cryptofeed.defines import EXX as EXX_str
+from cryptofeed.exchanges import *
 from cryptofeed.nbbo import NBBO
-
+from cryptofeed.feed import RestFeed
 
 
 LOG = get_logger('feedhandler', 'feedhandler.log')
+
+
+# Maps string name to class name for use with config
 _EXCHANGES = {
-    Gdax: GDAX,
+    BINANCE: Binance,
+    COINBASE: Coinbase,
     GEMINI: Gemini,
     HITBTC: HitBTC,
     POLONIEX: Poloniex,
     BITFINEX: Bitfinex,
     BITMEX: Bitmex,
     BITSTAMP: Bitstamp,
+    KRAKEN: Kraken,
+    HUOBI: Huobi,
+    HUOBI_US: HuobiUS,
+    OKCOIN: OKCoin,
+    OKEX: OKEx,
+    COINBENE: Coinbene,
+    DERIBIT: Deribit,
+    EXX_str: EXX
 }
 
 
-
 class FeedHandler:
-    def __init__(self, retries=10, timeout_interval=5):
+    def __init__(self, retries=10, timeout_interval=10):
         """
         retries: int
             number of times the connection will be retried (in the event of a disconnect or other failure)
@@ -85,40 +96,73 @@ class FeedHandler:
         """
         cb = NBBO(callback, pairs)
         for feed in feeds:
-            self.add_feed(feed(channels=[TICKER], pairs=pairs, callbacks={TICKER: cb}), timeout=timeout)
+            if feed.id == 'GEMINI':
+                for pair in pairs:
+                    self.add_feed(feed(pairs=[pair], callbacks={L2_BOOK: cb}), timeout=timeout)
+            else:
+                self.add_feed(feed(channels=[L2_BOOK], pairs=pairs, callbacks={L2_BOOK: cb}), timeout=timeout)
 
     def run(self):
-        if self.feeds == []:
+        if len(self.feeds) == 0:
             LOG.error('No feeds specified')
             raise ValueError("No feeds specified")
 
         try:
+            loop = asyncio.get_event_loop()
+
             for feed in self.feeds:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._connect(feed))
+                if isinstance(feed, RestFeed):
+                    loop.create_task(self._rest_connect(feed))
+                else:
+                    loop.create_task(self._connect(feed))
             loop.run_forever()
         except KeyboardInterrupt:
             LOG.info("Keyboard Interrupt received - shutting down")
-            pass
         except Exception:
             LOG.error("Unhandled exception", exc_info=True)
 
     async def _watch(self, feed_id, websocket):
         while websocket.open:
             if self.last_msg[feed_id]:
-                if dt.utcnow() - timedelta(seconds=self.timeout[feed_id]) > self.last_msg[feed_id]:
+                if time() - self.last_msg[feed_id] > self.timeout[feed_id]:
                     LOG.warning("%s: received no messages within timeout, restarting connection", feed_id)
                     await websocket.close()
                     break
             await asyncio.sleep(self.timeout_interval)
 
+    async def _rest_connect(self, feed):
+        """
+        Connect to REST feed
+        """
+        retries = 0
+        delay = 1
+        while retries <= self.retries:
+            await feed.subscribe()
+            try:
+                while True:
+                    await feed.message_handler()
+            except Exception:
+                LOG.error("%s: encountered an exception, reconnecting", feed.id, exc_info=True)
+                await asyncio.sleep(delay)
+                retries += 1
+                delay *= 2
+
+        LOG.error("%s: failed to reconnect after %d retries - exiting", feed.id, retries)
+
     async def _connect(self, feed):
+        """
+        Connect to websocket feeds
+        """
         retries = 0
         delay = 1
         while retries <= self.retries:
             self.last_msg[feed.id] = None
             try:
-                async with websockets.connect(feed.address) as websocket:
+                # Coinbase frequently will not respond to pings within the ping interval, so
+                # disable the interval in favor of the internal watcher, which will
+                # close the connection and reconnect in the event that no message from the exchange
+                # has been received (as opposed to a missing ping)
+                async with websockets.connect(feed.address, ping_interval=30, ping_timeout=None) as websocket:
                     asyncio.ensure_future(self._watch(feed.id, websocket))
                     # connection was successful, reset retry count and delay
                     retries = 0
@@ -126,11 +170,11 @@ class FeedHandler:
                     await feed.subscribe(websocket)
                     await self._handler(websocket, feed.message_handler, feed.id)
             except (ConnectionClosed, ConnectionAbortedError, ConnectionResetError, socket_error) as e:
-                LOG.warning("%s: encountered connection issue %s - reconnecting...", feed.id, str(e))
+                LOG.warning("%s: encountered connection issue %s - reconnecting...", feed.id, str(e), exc_info=True)
                 await asyncio.sleep(delay)
                 retries += 1
                 delay *= 2
-            except Exception as e:
+            except Exception:
                 LOG.error("%s: encountered an exception, reconnecting", feed.id, exc_info=True)
                 await asyncio.sleep(delay)
                 retries += 1
@@ -140,10 +184,14 @@ class FeedHandler:
 
     async def _handler(self, websocket, handler, feed_id):
         async for message in websocket:
-            self.last_msg[feed_id] = dt.utcnow()
+            self.last_msg[feed_id] = time()
             try:
                 await handler(message)
             except Exception:
+                if feed_id in {HUOBI, HUOBI_US}:
+                    message = zlib.decompress(message, 16+zlib.MAX_WBITS)
+                elif feed_id in {OKCOIN, OKEX}:
+                    message = zlib.decompress(message, -15)
                 LOG.error("%s: error handling message %s", feed_id, message)
                 # exception will be logged with traceback when connection handler
                 # retries the connection

@@ -1,21 +1,18 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
 import json
-import asyncio
 import logging
 from decimal import Decimal
 
-import requests
 from sortedcontainers import SortedDict as sd
 
-from cryptofeed.exchanges import BITSTAMP
 from cryptofeed.feed import Feed
-from cryptofeed.defines import BID, ASK, TRADES, L3_BOOK
-from cryptofeed.standards import pair_exchange_to_std, pair_std_to_exchange
+from cryptofeed.defines import BUY, SELL, BID, ASK, TRADES, L2_BOOK, L3_BOOK, BITSTAMP
+from cryptofeed.standards import pair_exchange_to_std, feed_to_exchange
 
 
 LOG = logging.getLogger('feedhandler')
@@ -23,125 +20,89 @@ LOG = logging.getLogger('feedhandler')
 
 class Bitstamp(Feed):
     id = BITSTAMP
+    # API documentation: https://www.bitstamp.net/websocket/v2/
 
-    def __init__(self, pairs=None, channels=None, callbacks=None):
+    def __init__(self, pairs=None, channels=None, callbacks=None, **kwargs):
         super().__init__(
-            'wss://ws.pusherapp.com/app/de504dc5763aeef9ff52?protocol=7&client=js&version=2.1.6&flash=false',
+            'wss://ws.bitstamp.net/',
             pairs=pairs,
             channels=channels,
-            callbacks=callbacks
+            callbacks=callbacks,
+            **kwargs
         )
-        self.seq_no = {}
-        self.snapshot_processed = False
 
-    async def _process_snapshot(self):
-        self.book = {}
-        loop = asyncio.get_event_loop()
-        btc_usd_url = 'https://www.bitstamp.net/api/order_book/'
-        url = 'https://www.bitstamp.net/api/v2/order_book/{}/'
-        futures = [loop.run_in_executor(None, requests.get, url.format(pair) if pair != 'BTC-USD' else btc_usd_url) for pair in self.pairs]
-
-        results = []
-        for future in futures:
-            ret = await future
-            results.append(ret)
-
-        for res, pair in zip(results, self.pairs):
-            orders = res.json()
-            pair = pair_exchange_to_std(pair)
-            self.book[pair] = {BID: sd(), ASK: sd()}
-            self.seq_no[pair] = orders['timestamp']
-
-            for side in (BID, ASK):
-                for price, size in orders[side+'s']:
-                    price = Decimal(price)
-                    size = Decimal(size)
-                    if price in self.book[pair][side]:
-                        self.book[pair][side][price] += size
-                    else:
-                        self.book[pair][side][price] = size
-        self.snapshot_processed = True
-
-    async def _order_book(self, msg):
-        if not self.snapshot_processed:
-            await self._process_snapshot()
+    async def _l2_book(self, msg):
         data = msg['data']
         chan = msg['channel']
-        pair = None
-        if chan == 'diff_order_book':
-            pair = 'BTC-USD'
-        else:
-            pair = pair_exchange_to_std(chan.split('_')[-1])
+        timestamp = data['timestamp']
+        pair = pair_exchange_to_std(chan.split('_')[-1])
 
-        if pair in self.seq_no:
-            if data['timestamp'] <= self.seq_no[pair]:
-                return
-            else:
-                del self.seq_no[pair]
-
+        book = {}
         for side in (BID, ASK):
-            for price, size in data[side+'s']:
+            book[side] = sd({Decimal(price): Decimal(size) for price, size in data[side + 's']})
+        self.l2_book[pair] = book
+        await self.book_callback(pair=pair, book_type=L2_BOOK, forced=False, delta=False, timestamp=timestamp)
+
+    async def _l3_book(self, msg):
+        data = msg['data']
+        chan = msg['channel']
+        timestamp = data['timestamp']
+        pair = pair_exchange_to_std(chan.split('_')[-1])
+
+        book = {BID: sd(), ASK: sd()}
+        for side in (BID, ASK):
+            for price, size, order_id in data[side + 's']:
                 price = Decimal(price)
                 size = Decimal(size)
-                if size == 0:
-                    if price in self.book[pair][side]:
-                        del self.book[pair][side][price]
-                else:
-                    self.book[pair][side][price] = size
-        await self.callbacks[L3_BOOK](feed=self.id, pair=pair, book=self.book[pair])
+                book[side].get(price, sd())[order_id] = size
+        self.l3_book[pair] = book
+        await self.book_callback(pair=pair, book_type=L3_BOOK, forced=False, delta=False, timestamp=timestamp)
 
     async def _trades(self, msg):
         data = msg['data']
         chan = msg['channel']
-        pair = None
-        if chan == 'live_trades':
-            pair = 'BTC-USD'
-        else:
-            pair = pair_exchange_to_std(chan.split('_')[-1])
+        pair = pair_exchange_to_std(chan.split('_')[-1])
 
-        side = 'BUY' if data['type'] == 0 else 'SELL'
+        side = BUY if data['type'] == 0 else SELL
         amount = Decimal(data['amount'])
         price = Decimal(data['price'])
+        timestamp = data['timestamp']
+        order_id = data['id']
         await self.callbacks[TRADES](feed=self.id,
                                      pair=pair,
                                      side=side,
                                      amount=amount,
-                                     price=price)
+                                     price=price,
+                                     timestamp=timestamp,
+                                     order_id=order_id
+                                     )
 
     async def message_handler(self, msg):
-        # for some reason the internal parts of the message
-        # are formatted in such a way that it wont parse from
-        # string to json without stripping some extra quotes and
-        # slashes
-        msg = msg.replace("\\", '')
-        msg = msg.replace("\"{", "{")
-        msg = msg.replace("}\"", "}")
         msg = json.loads(msg, parse_float=Decimal)
-        if 'pusher' in msg['event']:
-            if msg['event'] == 'pusher:connection_established':
+        if 'bts' in msg['event']:
+            if msg['event'] == 'bts:connection_established':
                 pass
-            elif msg['event'] == 'pusher_internal:subscription_succeeded':
+            elif msg['event'] == 'bts:subscription_succeeded':
                 pass
             else:
-                LOG.warning("{} - Unexpected pusher message {}".format(self.id, msg))
+                LOG.warning("%s: Unexpected message %s", self.id, msg)
         elif msg['event'] == 'trade':
             await self._trades(msg)
         elif msg['event'] == 'data':
-            await self._order_book(msg)
+            if msg['channel'].startswith(feed_to_exchange(self.id, L2_BOOK)):
+                await self._l2_book(msg)
+            if msg['channel'].startswith(feed_to_exchange(self.id, L3_BOOK)):
+                await self._l3_book(msg)
         else:
-            LOG.warning("{} - Invalid message type {}".format(self.id, msg))
+            LOG.warning("%s: Invalid message type %s", self.id, msg)
 
     async def subscribe(self, websocket):
-        # if channel is order book we need to subscribe to the diff channel
-        # to get updates, hit the REST endpoint to get the current complete state,
-        # then process the updates from the diff channel, ignoring any updates that
-        # are pre-timestamp on the response from the REST endpoint
-        for channel in self.channels:
-            for pair in self.pairs:
+        for channel in self.channels if not self.config else self.config:
+            for pair in self.pairs if not self.config else self.config[channel]:
                 await websocket.send(
                     json.dumps({
-                        "event": "pusher:subscribe",
+                        "event": "bts:subscribe",
                         "data": {
-                            "channel": "{}_{}".format(channel, pair) if pair != 'btcusd' else channel
+                            "channel": "{}_{}".format(channel, pair)
                         }
                     }))

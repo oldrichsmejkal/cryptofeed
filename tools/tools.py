@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -7,6 +7,12 @@ associated with this software.
 from urllib.request import urlopen
 import requests
 import json
+
+
+"""
+Just random functions I used while developing the library.
+They may come in handy again . . .
+"""
 
 
 def poloniex_get_ticker_map():
@@ -36,12 +42,12 @@ def bittrex_get_trading_pairs():
         print("]", end='')
 
 
-def gdax_get_trading_pairs():
-    with urlopen('https://api.gdax.com/products') as url:
+def coinbase_get_trading_pairs():
+    with urlopen('https://api.pro.coinbase.com/products') as url:
         data = json.loads(url.read().decode())
         print('[', end='')
         for pair in data:
-            print("'" + pair['id'] +"',",)
+            print("'" + pair['id'] + "',",)
         print("]")
 
 
@@ -50,8 +56,9 @@ def hitbtc_get_trading_pairs():
         data = json.loads(url.read().decode())
         print('[', end='')
         for pair in data:
-            print("'" + pair['id'] +"',",)
+            print("'" + pair['id'] + "',",)
         print("]")
+
 
 def cex_get_trading_pairs():
     r = requests.get('https://cex.io/api/currency_limits')
@@ -67,6 +74,7 @@ def exx_get_trading_pairs():
     for key in r.json():
         print("'{}',".format(key))
     print("]")
+
 
 def bitmex_instruments():
     r = requests.get('https://www.bitmex.com/api/v1/instrument/active')

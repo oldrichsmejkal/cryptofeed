@@ -1,21 +1,29 @@
+'''
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
+
+Please see the LICENSE file for the terms and conditions
+associated with this software.
+'''
 from time import sleep
 import time
 import hashlib
 import hmac
 from urllib.parse import urlparse
+import logging
 
+from sortedcontainers import SortedDict as sd
 import requests
 import pandas as pd
 
-from cryptofeed.rest.api import API
-from cryptofeed.feeds import BITMEX
-from cryptofeed.log import get_logger
+from cryptofeed.rest.api import API, request_retry
+from cryptofeed.defines import BITMEX, SELL, BUY, BID, ASK
+from cryptofeed.standards import timestamp_normalize
 
 
 API_MAX = 500
 API_REFRESH = 300
 
-LOG = get_logger('rest', 'rest.log')
+LOG = logging.getLogger('rest')
 
 
 class Bitmex(API):
@@ -48,66 +56,52 @@ class Bitmex(API):
         }
 
     def _get(self, ep, symbol, start_date, end_date, retry, retry_wait, freq='6H'):
-        dates = pd.interval_range(pd.Timestamp(start_date), pd.Timestamp(end_date), freq=freq).tolist()
-        if len(dates) == 0:
-            dates.append(pd.Interval(left=pd.Timestamp(start_date), right=pd.Timestamp(end_date)))
-        elif dates[-1].right < pd.Timestamp(end_date):
-            dates.append(pd.Interval(dates[-1].right, pd.Timestamp(end_date)))
+        dates = [None]
+        if start_date:
+            if not end_date:
+                end_date = pd.Timestamp.utcnow()
+            dates = pd.interval_range(API._timestamp(start_date), API._timestamp(end_date), freq=freq).tolist()
+            if len(dates) == 0:
+                dates.append(pd.Interval(left=API._timestamp(start_date), right=API._timestamp(end_date)))
+            elif dates[-1].right < API._timestamp(end_date):
+                dates.append(pd.Interval(dates[-1].right, API._timestamp(end_date)))
+
+        @request_retry(self.ID, retry, retry_wait)
+        def helper(start, start_date, end_date):
+            if start_date and end_date:
+                endpoint = f'/api/v1/{ep}?symbol={symbol}&count={API_MAX}&reverse=false&start={start}&startTime={start_date}&endTime={end_date}'
+            else:
+                endpoint = f'/api/v1/{ep}?symbol={symbol}&reverse=true'
+            header = {}
+            if self.key_id and self.key_secret:
+                header = self._generate_signature("GET", endpoint)
+            header['Accept'] = 'application/json'
+            return requests.get('{}{}'.format(self.api, endpoint), headers=header)
 
         for interval in dates:
             start = 0
+            if interval is not None:
+                end = interval.right
+                end -= pd.Timedelta(nanoseconds=1)
 
-            end = interval.right
-            end -= pd.Timedelta(nanoseconds=1)
-
-            start_date = str(interval.left).replace(" ", "T") + "Z"
-            end_date = str(end).replace(" ", "T") + "Z"
+                start_date = str(interval.left).replace(" ", "T") + "Z"
+                end_date = str(end).replace(" ", "T") + "Z"
 
             while True:
-                endpoint = '/api/v1/{}?symbol={}&count={}&reverse=false&start={}&startTime={}&endTime={}'.format(ep, symbol, API_MAX, start, start_date, end_date)
-                header = {}
-                if self.key_id and self.key_secret:
-                    header = self._generate_signature("GET", endpoint)
-                header['Accept'] = 'application/json'
-                try:
-                    r = requests.get('{}{}'.format(self.api, endpoint), headers=header)
-                except TimeoutError as e:
-                    LOG.warning("%s: Timeout - %s", self.ID, e)
-                    if retry is not None:
-                        if retry == 0:
-                            raise
-                        else:
-                            retry -= 1
+                r = helper(start, start_date, end_date)
+
+                if r.status_code in {502, 504}:
+                    LOG.warning("%s: %d for URL %s - %s", self.ID, r.status_code, r.url, r.text)
                     sleep(retry_wait)
                     continue
-                except requests.exceptions.ConnectionError as e:
-                    LOG.warning("%s: Connection error - %s", self.ID, e)
-                    if retry is not None:
-                        if retry == 0:
-                            raise
-                        else:
-                            retry -= 1
-                    sleep(retry_wait)
+                elif r.status_code == 429:
+                    sleep(API_REFRESH)
                     continue
+                elif r.status_code != 200:
+                    self._handle_error(r, LOG)
 
-                try:
-                    if r.status_code == 502:
-                        LOG.warning("%s: 502 - %s", self.ID, r.text)
-                        sleep(retry_wait)
-                        continue
-                    elif r.status_code == 429:
-                        sleep(API_REFRESH)
-                        continue
-                    elif r.status_code != 200:
-                        r.raise_for_status()
-
-                    limit = int(r.headers['X-RateLimit-Remaining'])
-                    data = r.json()
-                except:
-                    LOG.error("%s: Status code %d", self.ID, r.status_code)
-                    LOG.error("%s: Headers: %s", self.ID, r.headers)
-                    LOG.error("%s: Resp: %s", self.ID, r.text)
-                    raise
+                limit = int(r.headers['X-RateLimit-Remaining'])
+                data = r.json()
 
                 yield data
 
@@ -121,11 +115,11 @@ class Bitmex(API):
 
     def _trade_normalization(self, trade: dict) -> dict:
         return {
-            'timestamp': trade['timestamp'],
+            'timestamp': timestamp_normalize(self.ID, trade['timestamp']),
             'pair': trade['symbol'],
             'id': trade['trdMatchID'],
             'feed': self.ID,
-            'side': trade['side'],
+            'side': BUY if trade['side'] == 'Buy' else SELL,
             'amount': trade['size'],
             'price': trade['price']
         }
@@ -147,9 +141,8 @@ class Bitmex(API):
             'foreignNotional': 1900
         }
         """
-        if start and end:
-            for data in self._get('trade', symbol, start, end, retry, retry_wait):
-                yield list(map(self._trade_normalization, data))
+        for data in self._get('trade', symbol, start, end, retry, retry_wait):
+            yield list(map(self._trade_normalization, data))
 
     def _funding_normalization(self, funding: dict) -> dict:
         return {
@@ -173,3 +166,11 @@ class Bitmex(API):
         """
         for data in self._get('funding', symbol, start, end, retry, retry_wait, freq='2W'):
             yield list(map(self._funding_normalization, data))
+
+    def l2_book(self, symbol: str, retry=None, retry_wait=10):
+        ret = {symbol: {BID: sd(), ASK: sd()}}
+        data = next(self._get('orderBook/L2', symbol, None, None, retry, retry_wait))
+        for update in data:
+            side = ASK if update['side'] == 'Sell' else BID
+            ret[symbol][side][update['price']] = update['size']
+        return ret

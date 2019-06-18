@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -8,25 +8,24 @@ import asyncio
 import json
 import logging
 from decimal import Decimal
-from collections import defaultdict
+import time
 
 import requests
 from sortedcontainers import SortedDict as sd
 
 from cryptofeed.feed import Feed
-from cryptofeed.callback import Callback
-from cryptofeed.exchanges import GDAX as GDAX_ID
-from cryptofeed.defines import L2_BOOK, L3_BOOK, BID, ASK, TRADES, TICKER, DEL, UPD
+from cryptofeed.defines import L2_BOOK, L3_BOOK, BUY, SELL, BID, ASK, TRADES, TICKER, COINBASE
+from cryptofeed.standards import timestamp_normalize
 
 
 LOG = logging.getLogger('feedhandler')
 
 
-class GDAX(Feed):
-    id = GDAX_ID
+class Coinbase(Feed):
+    id = COINBASE
 
-    def __init__(self, pairs=None, channels=None, callbacks=None):
-        super().__init__('wss://ws-feed.gdax.com', pairs=pairs, channels=channels, callbacks=callbacks)
+    def __init__(self, pairs=None, channels=None, callbacks=None, **kwargs):
+        super().__init__('wss://ws-feed.pro.coinbase.com', pairs=pairs, channels=channels, callbacks=callbacks, **kwargs)
         self.__reset()
 
     def __reset(self):
@@ -89,40 +88,44 @@ class GDAX(Feed):
             'time': '2018-05-21T00:26:05.585000Z'
         }
         '''
-        if self.l3_book:
-            delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        pair = msg['product_id']
+
+        if 'full' in self.channels or ('full' in self.config and pair in self.config['full']):
+            delta = {BID: [], ASK: []}
             price = Decimal(msg['price'])
             side = ASK if msg['side'] == 'sell' else BID
             size = Decimal(msg['size'])
-            pair = msg['product_id']
             maker_order_id = msg['maker_order_id']
+            timestamp = timestamp_normalize(self.id, msg['time'])
 
             _, new_size = self.order_map[maker_order_id]
             new_size -= size
             if new_size <= 0:
                 del self.order_map[maker_order_id]
-                delta[side][DEL].append((maker_order_id, price))
+                delta[side].append((maker_order_id, price, 0))
                 del self.l3_book[pair][side][price][maker_order_id]
                 if len(self.l3_book[pair][side][price]) == 0:
                     del self.l3_book[pair][side][price]
             else:
                 self.order_map[maker_order_id] = (price, new_size)
                 self.l3_book[pair][side][price][maker_order_id] = new_size
-                delta[side][UPD].append((maker_order_id, price, new_size))
+                delta[side].append((maker_order_id, price, new_size))
 
-            await self.book_callback(pair, L3_BOOK, False, delta)
+            await self.book_callback(pair, L3_BOOK, False, delta, timestamp)
 
         await self.callbacks[TRADES](
-                feed=self.id,
-                pair=msg['product_id'],
-                id=msg['trade_id'],
-                side=BID if msg['side'] == 'buy' else ASK,
-                amount=msg['size'],
-                price=msg['price'],
-                timestamp=msg['time']
-            )
+            feed=self.id,
+            pair=msg['product_id'],
+            order_id=msg['trade_id'],
+            side=SELL if msg['side'] == 'buy' else BUY,
+            amount=Decimal(msg['size']),
+            price=Decimal(msg['price']),
+            timestamp=timestamp_normalize(self.id, msg['time'])
+
+        )
 
     async def _pair_level2_snapshot(self, msg):
+        timestamp = time.time()
         self.l2_book[msg['product_id']] = {
             BID: sd({
                 Decimal(price): Decimal(amount)
@@ -134,42 +137,48 @@ class GDAX(Feed):
             })
         }
 
-        await self.book_callback(msg['product_id'], L2_BOOK, True, None)
+        await self.book_callback(msg['product_id'], L2_BOOK, True, None, timestamp)
 
     async def _pair_level2_update(self, msg):
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        timestamp = time.time()
+        delta = {BID: [], ASK: []}
         for side, price, amount in msg['changes']:
             side = BID if side == 'buy' else ASK
             price = Decimal(price)
             amount = Decimal(amount)
             bidask = self.l2_book[msg['product_id']][side]
 
-            if amount == "0":
+            if amount == 0:
                 del bidask[price]
-                delta[side][DEL].append(price)
+                delta[side].append((price, 0))
             else:
                 bidask[price] = amount
-                delta[side][UPD].append((price, amount))
+                delta[side].append((price, amount))
 
-        await self.book_callback(msg['product_id'], L2_BOOK, False, delta)
+        await self.book_callback(msg['product_id'], L2_BOOK, False, delta, timestamp)
 
-    async def _book_snapshot(self):
+    async def _book_snapshot(self, pairs):
         self.__reset()
-        loop = asyncio.get_event_loop()
-        url = 'https://api.gdax.com/products/{}/book?level=3'
-        futures = [loop.run_in_executor(None, requests.get, url.format(pair)) for pair in self.pairs]
+        # Coinbase needs some time to send messages to us
+        # before we request the snapshot. If we don't sleep
+        # the snapshot seq no could be much earlier than
+        # the subsequent messages, causing a seq no mismatch.
+        await asyncio.sleep(2)
+
+        url = 'https://api.pro.coinbase.com/products/{}/book?level=3'
+        urls = [url.format(pair) for pair in pairs]
 
         results = []
-        for future in futures:
-            ret = await future
+        for url in urls:
+            ret = requests.get(url)
             results.append(ret)
 
-        for res, pair in zip(results, self.pairs):
+        for res, pair in zip(results, pairs):
             orders = res.json()
             self.l3_book[pair] = {BID: sd(), ASK: sd()}
             self.seq_no[pair] = orders['sequence']
             for side in (BID, ASK):
-                for price, size, order_id in orders[side+'s']:
+                for price, size, order_id in orders[side + 's']:
                     price = Decimal(price)
                     size = Decimal(size)
                     if price in self.l3_book[pair][side]:
@@ -177,16 +186,17 @@ class GDAX(Feed):
                     else:
                         self.l3_book[pair][side][price] = {order_id: size}
                     self.order_map[order_id] = (price, size)
-
-            await self.callbacks[L3_BOOK](feed=self.id, pair=pair, book=self.l3_book[pair])
+            timestamp = time.time()
+            await self.callbacks[L3_BOOK](feed=self.id, pair=pair, book=self.l3_book[pair], timestamp=timestamp)
 
     async def _open(self, msg):
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
         price = Decimal(msg['price'])
         side = ASK if msg['side'] == 'sell' else BID
         size = Decimal(msg['remaining_size'])
         pair = msg['product_id']
         order_id = msg['order_id']
+        timestamp = timestamp_normalize(self.id, msg['time'])
 
         if price in self.l3_book[pair][side]:
             self.l3_book[pair][side][price][order_id] = size
@@ -194,19 +204,19 @@ class GDAX(Feed):
             self.l3_book[pair][side][price] = {order_id: size}
         self.order_map[order_id] = (price, size)
 
-        delta[side][UPD].append((order_id, price, size))
+        delta[side].append((order_id, price, size))
 
-        await self.book_callback(pair, L3_BOOK, False, delta)
+        await self.book_callback(pair, L3_BOOK, False, delta, timestamp)
 
     async def _done(self, msg):
         """
-        per GDAX API Docs:
+        per Coinbase API Docs:
 
         A done message will be sent for received orders which are fully filled or canceled due
         to self-trade prevention. There will be no open message for such orders. Done messages
         for orders which are not on the book should be ignored when maintaining a real-time order book.
         """
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
 
         if 'price' not in msg:
             return
@@ -218,21 +228,22 @@ class GDAX(Feed):
         price = Decimal(msg['price'])
         side = ASK if msg['side'] == 'sell' else BID
         pair = msg['product_id']
+        timestamp = timestamp_normalize(self.id, msg['time'])
 
         del self.l3_book[pair][side][price][order_id]
         if len(self.l3_book[pair][side][price]) == 0:
             del self.l3_book[pair][side][price]
-        delta[side][DEL].append((order_id, price))
+        delta[side].append((order_id, price, 0))
         del self.order_map[order_id]
 
-        await self.book_callback(pair, L3_BOOK, False, delta)
+        await self.book_callback(pair, L3_BOOK, False, delta, timestamp)
 
     async def _change(self, msg):
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
 
         if 'price' not in msg or not msg['price']:
             return
-
+        timestamp = timestamp_normalize(self.id, msg['time'])
         order_id = msg['order_id']
         price = Decimal(msg['price'])
         side = ASK if msg['side'] == 'sell' else BID
@@ -242,24 +253,24 @@ class GDAX(Feed):
         self.l3_book[pair][side][price][order_id] = new_size
         self.order_map[order_id] = (price, new_size)
 
-        delta[side][UPD].append((order_id, price, new_size))
+        delta[side].append((order_id, price, new_size))
 
-        await self.book_callback(pair, L3_BOOK, False, delta)
+        await self.book_callback(pair, L3_BOOK, False, delta, timestamp)
 
     async def message_handler(self, msg):
         msg = json.loads(msg, parse_float=Decimal)
-        if 'full' in self.channels and 'product_id' in msg and 'sequence' in msg:
+
+        if 'product_id' in msg and 'sequence' in msg and ('full' in self.channels or ('full' in self.config and msg['product_id'] in self.config['full'])):
             pair = msg['product_id']
             if msg['sequence'] <= self.seq_no[pair]:
                 return
-            elif 'full' in self.channels and msg['sequence'] != self.seq_no[pair] + 1:
-                LOG.warning("%s: Missing sequence number detected", self.id)
+            elif ('full' in self.channels or 'full' in self.config) and msg['sequence'] != self.seq_no[pair] + 1:
+                LOG.warning("%s: Missing sequence number detected for %s", self.id, pair)
                 LOG.warning("%s: Requesting book snapshot", self.id)
-                await self._book_snapshot()
+                await self._book_snapshot(self.pairs or self.book_pairs)
                 return
 
             self.seq_no[pair] = msg['sequence']
-
 
         if 'type' in msg:
             if msg['type'] == 'ticker':
@@ -287,9 +298,22 @@ class GDAX(Feed):
 
     async def subscribe(self, websocket):
         self.__reset()
-        await websocket.send(json.dumps({"type": "subscribe",
-                                         "product_ids": self.pairs,
-                                         "channels": self.channels
-                                        }))
-        if 'full' in self.channels:
-            await self._book_snapshot()
+        snapshot = False
+        self.book_pairs = []
+
+        if self.config:
+            for chan in self.config:
+                await websocket.send(json.dumps({"type": "subscribe",
+                                         "product_ids": self.config[chan],
+                                         "channels": [chan]
+                                         }))
+                if 'full' in chan:
+                    snapshot = True
+                    self.book_pairs.extend(self.config[chan])
+        else:
+            await websocket.send(json.dumps({"type": "subscribe",
+                                            "product_ids": self.pairs,
+                                            "channels": self.channels
+                                            }))
+        if 'full' in self.channels or snapshot:
+            await self._book_snapshot(self.pairs or self.book_pairs)

@@ -4,7 +4,16 @@ bitmex:
 bitfinex:
     key_id: null
     key_secret: null
-gdax:
+coinbase:
     key_id: null
     key_secret: null
     key_passphrase: null
+poloniex:
+    key_id: null
+    key_secret: null
+gemini:
+    key_id: null
+    key_secret: null
+kraken:
+    key_id: null
+    key_secret: null

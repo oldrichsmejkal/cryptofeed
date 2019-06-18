@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -8,14 +8,14 @@ import json
 import logging
 from decimal import Decimal
 from collections import defaultdict
+import time
 
 from sortedcontainers import SortedDict as sd
 
 from cryptofeed.exceptions import MissingSequenceNumber
 from cryptofeed.feed import Feed
-from cryptofeed.defines import TICKER, TRADES, L3_BOOK, BID, ASK, L2_BOOK, FUNDING, DEL, UPD
-from cryptofeed.exchanges import BITFINEX
-from cryptofeed.standards import pair_exchange_to_std
+from cryptofeed.defines import TICKER, TRADES, L3_BOOK, BUY, SELL, BID, ASK, L2_BOOK, FUNDING, BITFINEX
+from cryptofeed.standards import pair_exchange_to_std, timestamp_normalize
 
 
 LOG = logging.getLogger('feedhandler')
@@ -40,23 +40,25 @@ CHECKSUM = 131072
 class Bitfinex(Feed):
     id = BITFINEX
 
-    def __init__(self, pairs=None, channels=None, callbacks=None):
-        super().__init__('wss://api.bitfinex.com/ws/2', pairs, channels, callbacks)
-        '''
-        maps channel id (int) to a dict of
-           symbol: channel's currency
-           channel: channel name
-           handler: the handler for this channel type
-        '''
+    def __init__(self, pairs=None, channels=None, callbacks=None, **kwargs):
+        if channels is not None and FUNDING in channels:
+            if len(channels) > 1:
+                raise ValueError("Funding channel must be in a separate feedhanlder on Bitfinex or you must use config")
+        super().__init__('wss://api.bitfinex.com/ws/2', pairs=pairs, channels=channels, callbacks=callbacks, **kwargs)
         self.__reset()
 
     def __reset(self):
         self.l2_book = {}
         self.l3_book = {}
+        '''
+        channel map maps channel id (int) to a dict of
+           symbol: channel's currency
+           channel: channel name
+           handler: the handler for this channel type
+        '''
         self.channel_map = {}
         self.order_map = defaultdict(dict)
         self.seq_no = 0
-
 
     async def _ticker(self, msg):
         chan_id = msg[0]
@@ -82,14 +84,12 @@ class Bitfinex(Feed):
 
         async def _trade_update(trade):
             if funding:
-                id, timestamp, amount, price, period = trade
+                order_id, timestamp, amount, price, period = trade
             else:
-                id, timestamp, amount, price = trade
+                order_id, timestamp, amount, price = trade
                 period = None
-            if amount < 0:
-                side = ASK
-            else:
-                side = BID
+            timestamp = timestamp_normalize(self.id, timestamp)
+            side = SELL if amount < 0 else BUY
             amount = abs(amount)
             if period:
                 await self.callbacks[FUNDING](feed=self.id,
@@ -97,17 +97,17 @@ class Bitfinex(Feed):
                                               side=side,
                                               amount=amount,
                                               price=price,
-                                              id=id,
+                                              order_id=order_id,
                                               timestamp=timestamp,
                                               period=period)
             else:
                 await self.callbacks[TRADES](feed=self.id,
-                                            pair=pair,
-                                            side=side,
-                                            amount=amount,
-                                            price=price,
-                                            id=id,
-                                            timestamp=timestamp)
+                                             pair=pair,
+                                             side=side,
+                                             amount=amount,
+                                             price=price,
+                                             order_id=order_id,
+                                             timestamp=timestamp)
 
         if isinstance(msg[1], list):
             # snapshot
@@ -130,10 +130,11 @@ class Bitfinex(Feed):
         """
         For L2 book updates
         """
+        timestamp = time.time()
         chan_id = msg[0]
         pair = self.channel_map[chan_id]['symbol']
         pair = pair_exchange_to_std(pair)
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
         forced = False
 
         if isinstance(msg[1], list):
@@ -142,6 +143,9 @@ class Bitfinex(Feed):
                 self.l2_book[pair] = {BID: sd(), ASK: sd()}
                 for update in msg[1]:
                     price, _, amount = update
+                    price = Decimal(price)
+                    amount = Decimal(amount)
+
                     if amount > 0:
                         side = BID
                     else:
@@ -152,6 +156,8 @@ class Bitfinex(Feed):
             else:
                 # book update
                 price, count, amount = msg[1]
+                price = Decimal(price)
+                amount = Decimal(amount)
 
                 if amount > 0:
                     side = BID
@@ -161,24 +167,25 @@ class Bitfinex(Feed):
 
                 if count > 0:
                     # change at price level
-                    delta[side] = {UPD: [(price, amount)]}
+                    delta[side].append((price, amount))
                     self.l2_book[pair][side][price] = amount
                 else:
                     # remove price level
                     del self.l2_book[pair][side][price]
-                    delta[side] = {DEL: [price]}
+                    delta[side].append((price, 0))
         elif msg[1] == 'hb':
             pass
         else:
             LOG.warning("%s: Unexpected book msg %s", self.id, msg)
 
-        await self.book_callback(pair, L2_BOOK, forced, delta)
-
+        await self.book_callback(pair, L2_BOOK, forced, delta, timestamp)
 
     async def _raw_book(self, msg):
         """
         For L3 book updates
         """
+        timestamp = time.time()
+
         def add_to_book(pair, side, price, order_id, amount):
             if price in self.l3_book[pair][side]:
                 self.l3_book[pair][side][price][order_id] = amount
@@ -191,7 +198,7 @@ class Bitfinex(Feed):
             if len(self.l3_book[pair][side][price]) == 0:
                 del self.l3_book[pair][side][price]
 
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
         forced = False
         chan_id = msg[0]
         pair = self.channel_map[chan_id]['symbol']
@@ -205,6 +212,8 @@ class Bitfinex(Feed):
 
                 for update in msg[1]:
                     order_id, price, amount = update
+                    price = Decimal(price)
+                    amount = Decimal(amount)
 
                     if amount > 0:
                         side = BID
@@ -218,6 +227,8 @@ class Bitfinex(Feed):
             else:
                 # book update
                 order_id, price, amount = msg[1]
+                price = Decimal(price)
+                amount = Decimal(amount)
 
                 if amount > 0:
                     side = BID
@@ -229,19 +240,18 @@ class Bitfinex(Feed):
                     price = self.order_map[pair][side][order_id]['price']
                     remove_from_book(pair, side, order_id)
                     del self.order_map[pair][side][order_id]
-                    delta[side][DEL] = [(order_id, price)]
+                    delta[side].append((order_id, price, 0))
                 else:
                     if order_id in self.order_map[pair][side]:
                         del_price = self.order_map[pair][side][order_id]['price']
-                        delta[side][DEL] = [(order_id, del_price)]
+                        delta[side].append((order_id, del_price, 0))
                         # remove existing order before adding new one
-                        delta[side][UPD] = [(order_id, price, amount)]
+                        delta[side].append((order_id, price, amount))
                         remove_from_book(pair, side, order_id)
                     else:
-                        delta[side][UPD] = [(order_id, price, amount)]
+                        delta[side].append((order_id, price, amount))
                     add_to_book(pair, side, price, order_id, amount)
                     self.order_map[pair][side][order_id] = {'price': price, 'amount': amount}
-
 
         elif msg[1] == 'hb':
             return
@@ -249,7 +259,7 @@ class Bitfinex(Feed):
             LOG.warning("%s: Unexpected book msg %s", self.id, msg)
             return
 
-        await self.book_callback(pair, L3_BOOK, forced, delta)
+        await self.book_callback(pair, L3_BOOK, forced, delta, timestamp)
 
     async def message_handler(self, msg):
         msg = json.loads(msg, parse_float=Decimal)
@@ -259,7 +269,7 @@ class Bitfinex(Feed):
             if chan_id in self.channel_map:
                 seq_no = msg[-1]
                 if self.seq_no + 1 != seq_no:
-                    LOG.warning("%s: missing sequence number. Received %d, expected %d", self.id, seq_no, self.seq_no+1)
+                    LOG.warning("%s: missing sequence number. Received %d, expected %d", self.id, seq_no, self.seq_no + 1)
                     raise MissingSequenceNumber
                 self.seq_no = seq_no
 
@@ -294,12 +304,12 @@ class Bitfinex(Feed):
             'flags': SEQ_ALL
         }))
 
-        for channel in self.channels:
-            for pair in self.pairs:
+        for channel in self.channels if not self.config else self.config:
+            for pair in self.pairs if not self.config else self.config[channel]:
                 message = {'event': 'subscribe',
                            'channel': channel,
                            'symbol': pair
-                          }
+                           }
                 if 'book' in channel:
                     parts = channel.split('-')
                     if len(parts) != 1:

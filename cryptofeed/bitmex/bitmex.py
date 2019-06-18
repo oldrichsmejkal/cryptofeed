@@ -1,22 +1,21 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
-import asyncio
 import json
 import logging
 from collections import defaultdict
 from decimal import Decimal
+import time
 
 import requests
 from sortedcontainers import SortedDict as sd
 
 from cryptofeed.feed import Feed
-from cryptofeed.exchanges import BITMEX
-from cryptofeed.standards import pair_exchange_to_std
-from cryptofeed.defines import L2_BOOK, BID, ASK, TRADES, UPD, DEL, FUNDING, L3_BOOK
+from cryptofeed.defines import L2_BOOK, BUY, SELL, BID, ASK, TRADES, FUNDING, L3_BOOK, BITMEX, INSTRUMENT
+from cryptofeed.standards import timestamp_normalize
 
 
 LOG = logging.getLogger('feedhandler')
@@ -26,13 +25,18 @@ class Bitmex(Feed):
     id = BITMEX
     api = 'https://www.bitmex.com/api/v1/'
 
-    def __init__(self, pairs=None, channels=None, callbacks=None):
-        super().__init__('wss://www.bitmex.com/realtime', pairs=None, channels=channels, callbacks=callbacks)
+    def __init__(self, pairs=None, channels=None, callbacks=None, **kwargs):
+        super().__init__('wss://www.bitmex.com/realtime', pairs=pairs, channels=channels, callbacks=callbacks, **kwargs)
+
         active_pairs = self.get_active_symbols()
-        for pair in pairs:
-            if pair not in active_pairs:
-                raise ValueError("{} is not active on BitMEX".format(pair))
-        self.pairs = pairs
+        if self.config:
+            pairs = list(self.config.values())
+            self.pairs = [pair for inner in pairs for pair in inner]
+
+        for pair in self.pairs:
+            if not pair.startswith('.'):
+                if pair not in active_pairs:
+                    raise ValueError("{} is not active on BitMEX".format(pair))
         self._reset()
 
     def _reset(self):
@@ -76,20 +80,22 @@ class Bitmex(Feed):
         }
         """
         for data in msg['data']:
+            ts = timestamp_normalize(self.id, data['timestamp'])
             await self.callbacks[TRADES](feed=self.id,
                                          pair=data['symbol'],
-                                         side=BID if data['side'] == 'Buy' else ASK,
-                                         amount=data['size'],
-                                         price=data['price'],
-                                         id=data['trdMatchID'],
-                                         timestamp=data['timestamp'])
+                                         side=BUY if data['side'] == 'Buy' else SELL,
+                                         amount=Decimal(data['size']),
+                                         price=Decimal(data['price']),
+                                         order_id=data['trdMatchID'],
+                                         timestamp=ts)
 
     async def _book(self, msg):
         """
         the Full bitmex book
         """
+        timestamp = time.time()
         pair = None
-        delta = {BID: defaultdict(list), ASK: defaultdict(list)}
+        delta = {BID: [], ASK: []}
         # if we reset the book, force a full update
         forced = False
         if not self.partial_received:
@@ -103,9 +109,9 @@ class Bitmex(Feed):
         if msg['action'] == 'partial' or msg['action'] == 'insert':
             for data in msg['data']:
                 side = BID if data['side'] == 'Buy' else ASK
-                price = data['price']
+                price = Decimal(data['price'])
                 pair = data['symbol']
-                size = data['size']
+                size = Decimal(data['size'])
                 order_id = data['id']
 
                 if price in self.l3_book[pair][side]:
@@ -113,19 +119,19 @@ class Bitmex(Feed):
                 else:
                     self.l3_book[pair][side][price] = {order_id: size}
                 self.order_id[pair][side][order_id] = (price, size)
-                delta[side][UPD].append((order_id, price, size))
+                delta[side].append((order_id, price, size))
         elif msg['action'] == 'update':
             for data in msg['data']:
                 side = BID if data['side'] == 'Buy' else ASK
                 pair = data['symbol']
-                update_size = data['size']
+                update_size = Decimal(data['size'])
                 order_id = data['id']
 
                 price, _ = self.order_id[pair][side][order_id]
 
                 self.l3_book[pair][side][price][order_id] = update_size
                 self.order_id[pair][side][order_id] = (price, update_size)
-                delta[side][UPD].append((order_id, price, update_size))
+                delta[side].append((order_id, price, update_size))
         elif msg['action'] == 'delete':
             for data in msg['data']:
                 pair = data['symbol']
@@ -139,20 +145,21 @@ class Bitmex(Feed):
                 if len(self.l3_book[pair][side][delete_price]) == 0:
                     del self.l3_book[pair][side][delete_price]
 
-                delta[side][DEL].append((order_id, delete_price))
+                delta[side].append((order_id, delete_price, 0))
 
         else:
             LOG.warning("%s: Unexpected L3 Book message %s", self.id, msg)
             return
 
-        await self.book_callback(pair, L3_BOOK, forced, delta)
+        await self.book_callback(pair, L3_BOOK, forced, delta, timestamp)
 
     async def _l2_book(self, msg):
         """
         top 10 orders from each side
         """
+        timestamp = msg['data'][0]['timestamp']
+        timestamp = timestamp_normalize(self.id, timestamp)
         pair = None
-
         for update in msg['data']:
             pair = update['symbol']
             self.l2_book[pair][BID] = sd({
@@ -164,7 +171,7 @@ class Bitmex(Feed):
                 for price, amount in update['asks']
             })
 
-        await self.callbacks[L2_BOOK](feed=self.id, pair=pair, book=self.l2_book[pair])
+        await self.callbacks[L2_BOOK](feed=self.id, pair=pair, book=self.l2_book[pair], timestamp=timestamp)
 
     async def _funding(self, msg):
         """
@@ -196,14 +203,23 @@ class Bitmex(Feed):
         }
         """
         for data in msg['data']:
+            ts = timestamp_normalize(self.id, data['timestamp'])
             await self.callbacks[FUNDING](feed=self.id,
                                           pair=data['symbol'],
-                                          timestamp=data['timestamp'],
+                                          timestamp=ts,
                                           interval=data['fundingInterval'],
                                           rate=data['fundingRate'],
                                           rate_daily=data['fundingRateDaily']
-                                         )
+                                          )
 
+    async def _instrument(self, msg):
+        for data in msg['data']:
+            ts = timestamp_normalize(self.id, data['timestamp'])
+            data['timestamp'] = ts
+            await self.callbacks[INSTRUMENT](feed=self.id,
+                                            pair=data['symbol'],
+                                            **data
+                                            )
 
     async def message_handler(self, msg):
         msg = json.loads(msg, parse_float=Decimal)
@@ -223,14 +239,16 @@ class Bitmex(Feed):
                 await self._funding(msg)
             elif msg['table'] == 'orderBook10':
                 await self._l2_book(msg)
+            elif msg['table'] == 'instrument':
+                await self._instrument(msg)
             else:
                 LOG.warning("%s: Unhandled message %s", self.id, msg)
 
     async def subscribe(self, websocket):
         self._reset()
         chans = []
-        for channel in self.channels:
-            for pair in self.pairs:
+        for channel in self.channels if not self.config else self.config:
+            for pair in self.pairs if not self.config else self.config[channel]:
                 chans.append("{}:{}".format(channel, pair))
 
         await websocket.send(json.dumps({"op": "subscribe",

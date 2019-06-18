@@ -1,5 +1,5 @@
 '''
-Copyright (C) 2017-2018  Bryant Moscon - bmoscon@gmail.com
+Copyright (C) 2017-2019  Bryant Moscon - bmoscon@gmail.com
 
 Please see the LICENSE file for the terms and conditions
 associated with this software.
@@ -7,16 +7,15 @@ associated with this software.
 import json
 import logging
 from decimal import Decimal
+import time
 
 from sortedcontainers import SortedDict as sd
 
 from cryptofeed.exceptions import MissingSequenceNumber
 from cryptofeed.feed import Feed
-from cryptofeed.callback import Callback
-from cryptofeed.defines import BID, ASK, TRADES, TICKER, L3_BOOK, VOLUME
-from cryptofeed.standards import pair_std_to_exchange, pair_exchange_to_std
-from cryptofeed.exchanges import POLONIEX
-from .pairs import poloniex_id_pair_mapping
+from cryptofeed.defines import BUY, SELL, BID, ASK, TRADES, TICKER, L2_BOOK, VOLUME, POLONIEX
+from cryptofeed.standards import pair_exchange_to_std, feed_to_exchange
+from cryptofeed.pairs import poloniex_id_pair_mapping
 
 
 LOG = logging.getLogger('feedhandler')
@@ -25,85 +24,127 @@ LOG = logging.getLogger('feedhandler')
 class Poloniex(Feed):
     id = POLONIEX
 
-    def __init__(self, pairs=None, channels=None, callbacks=None):
-        if pairs:
-            LOG.error("Poloniex does not support pairs")
-            raise ValueError("Poloniex does not support pairs")
-
+    def __init__(self, pairs=None, channels=None, callbacks=None, config=None, **kwargs):
+        self.pair_mapping = poloniex_id_pair_mapping()
         super().__init__('wss://api2.poloniex.com',
+                         pairs=pairs,
                          channels=channels,
-                         callbacks=callbacks)
+                         callbacks=callbacks,
+                         config=config,
+                         **kwargs)
+        """
+        Due to the way poloniex subcriptions work, need to do some
+        ugly manipulation of the config/channels,pairs to create a list
+        of channels to subscribe to for poloniex as well as a callback map
+        that we can use to determine if an update should be delivered to the
+        end client or not
+        """
+        p_ticker = feed_to_exchange(self.id, TICKER)
+        p_volume = feed_to_exchange(self.id, VOLUME)
+
+        if channels:
+            self.channels = self.pairs
+            check = channels
+            self.callback_map = {channel: set(pairs) for channel in channels if channel not in {p_ticker, p_volume}}
+        elif config:
+            self.channels = []
+            for c, v in self.config.items():
+                if c not in {p_ticker, p_volume}:
+                    self.channels.extend(v)
+            check = config
+            self.callback_map = {key: set(value) for key, value in config.items()}
+
+        if TICKER in check:
+            self.channels.append(p_ticker)
+        if VOLUME in check:
+            self.channels.append(p_volume)
         self.__reset()
 
+    def __do_callback(self, channel, pair):
+        return channel in self.callback_map and pair in self.callback_map[channel]
+
     def __reset(self):
-        self.l3_book = {}
+        self.l2_book = {}
         self.seq_no = {}
 
     async def _ticker(self, msg):
         # currencyPair, last, lowestAsk, highestBid, percentChange, baseVolume,
         # quoteVolume, isFrozen, 24hrHigh, 24hrLow
         pair_id, _, ask, bid, _, _, _, _, _, _ = msg
-        pair = pair_exchange_to_std(poloniex_id_pair_mapping[pair_id])
-        await self.callbacks[TICKER](feed=self.id,
-                                     pair=pair,
-                                     bid=bid,
-                                     ask=ask)
+        pair = pair_exchange_to_std(self.pair_mapping[pair_id])
+        if self.__do_callback(TICKER, pair):
+            await self.callbacks[TICKER](feed=self.id,
+                                        pair=pair,
+                                        bid=Decimal(bid),
+                                        ask=Decimal(ask))
 
     async def _volume(self, msg):
         # ['2018-01-02 00:45', 35361, {'BTC': '43811.201', 'ETH': '6747.243', 'XMR': '781.716', 'USDT': '196758644.806'}]
         # timestamp, exchange volume, dict of top volumes
         _, _, top_vols = msg
         for pair in top_vols:
-            top_vols[pair] = top_vols[pair]
-        self.callbacks[VOLUME](feed=self.id, **top_vols)
+            top_vols[pair] = Decimal(top_vols[pair])
+        if self.__do_callback(VOLUME, pair):
+            self.callbacks[VOLUME](feed=self.id, **top_vols)
 
     async def _book(self, msg, chan_id):
+        timestamp = time.time()
+        delta = {BID: [], ASK: []}
         msg_type = msg[0][0]
         pair = None
+        forced = False
         # initial update (i.e. snapshot)
         if msg_type == 'i':
+            forced = True
             pair = msg[0][1]['currencyPair']
             pair = pair_exchange_to_std(pair)
-            self.l3_book[pair] = {BID: sd(), ASK: sd()}
+            self.l2_book[pair] = {BID: sd(), ASK: sd()}
             # 0 is asks, 1 is bids
             order_book = msg[0][1]['orderBook']
             for key in order_book[0]:
-                amount = order_book[0][key]
-                price = key
-                self.l3_book[pair][ASK][price] = amount
+                amount = Decimal(order_book[0][key])
+                price = Decimal(key)
+                self.l2_book[pair][ASK][price] = amount
 
             for key in order_book[1]:
-                amount = order_book[1][key]
-                price = key
-                self.l3_book[pair][BID][price] = amount
+                amount = Decimal(order_book[1][key])
+                price = Decimal(key)
+                self.l2_book[pair][BID][price] = amount
         else:
-            pair = poloniex_id_pair_mapping[chan_id]
+            pair = self.pair_mapping[chan_id]
             pair = pair_exchange_to_std(pair)
             for update in msg:
                 msg_type = update[0]
                 # order book update
                 if msg_type == 'o':
                     side = ASK if update[1] == 0 else BID
-                    price = update[2]
-                    amount = update[3]
+                    price = Decimal(update[2])
+                    amount = Decimal(update[3])
                     if amount == 0:
-                        del self.l3_book[pair][side][price]
+                        delta[side].append((price, 0))
+                        del self.l2_book[pair][side][price]
                     else:
-                        self.l3_book[pair][side][price] = amount
+                        delta[side].append((price, amount))
+                        self.l2_book[pair][side][price] = amount
                 elif msg_type == 't':
                     # index 1 is trade id, 2 is side, 3 is price, 4 is amount, 5 is timestamp
-                    price = update[3]
-                    side = ASK if update[2] == 0 else BID
-                    amount = update[4]
-                    await self.callbacks[TRADES](feed=self.id,
-                                                 pair=pair,
-                                                 side=side,
-                                                 amount=amount,
-                                                 price=price)
+                    _, order_id, _, price, amount, timestamp = update
+                    price = Decimal(price)
+                    amount = Decimal(amount)
+                    side = BUY if update[2] == 1 else SELL
+                    if self.__do_callback(TRADES, pair):
+                        await self.callbacks[TRADES](feed=self.id,
+                                                    pair=pair,
+                                                    side=side,
+                                                    amount=amount,
+                                                    price=price,
+                                                    timestamp=timestamp,
+                                                    order_id=order_id)
                 else:
                     LOG.warning("%s: Unexpected message received: %s", self.id, msg)
 
-        await self.callbacks[L3_BOOK](feed=self.id, pair=pair, book=self.l3_book[pair])
+        if self.__do_callback(L2_BOOK, pair):
+            await self.book_callback(pair, L2_BOOK, forced, delta, timestamp)
 
     async def message_handler(self, msg):
         msg = json.loads(msg, parse_float=Decimal)
@@ -130,11 +171,10 @@ class Poloniex(Feed):
             # the trading pair being updated
             seq_no = msg[1]
 
-            if chan_id not in self.seq_no :
+            if chan_id not in self.seq_no:
                 self.seq_no[chan_id] = seq_no
             elif self.seq_no[chan_id] + 1 != seq_no:
-                LOG.warning("%s: missing sequence number. Received %d, expected %d", self.id, seq_no, self.seq_no+1)
-                self.__reset()
+                LOG.warning("%s: missing sequence number. Received %d, expected %d", self.id, seq_no, self.seq_no[chan_id] + 1)
                 raise MissingSequenceNumber
             self.seq_no[chan_id] = seq_no
             await self._book(msg[2], chan_id)
@@ -145,8 +185,8 @@ class Poloniex(Feed):
             LOG.warning('%s: Invalid message type %s', self.id, msg)
 
     async def subscribe(self, websocket):
+        self.__reset()
         for channel in self.channels:
-            print(channel)
             await websocket.send(json.dumps({"command": "subscribe",
                                              "channel": channel
-                                            }))
+                                             }))
